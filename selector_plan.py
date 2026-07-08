@@ -1294,8 +1294,89 @@ class ProblemAreaSelector:
             draw.rectangle([x0, y0, x1, y1], outline="red", width=3)
             draw.text((x0 + 4, max(0, y0 - 22)), f"#{area['id']}", fill="red", font=font)
 
-        annotated.save(path)
+        final_image = self._add_legend(annotated)
+        final_image.save(path)
         messagebox.showinfo("Succes", f"Imaginea adnotata a fost salvata in:\n{path}")
+
+    def _add_legend(self, annotated):
+        """Adauga sub imaginea adnotata o legenda cu descrierea fiecarei
+        probleme marcate (#id: descriere), ca informatia sa ramana vizibila
+        si in afara aplicatiei (nu doar in panoul lateral din interfata)."""
+        img_w, img_h = annotated.size
+
+        try:
+            header_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 26)
+            id_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
+            text_font = ImageFont.truetype("DejaVuSans.ttf", 18)
+        except Exception:
+            header_font = id_font = text_font = ImageFont.load_default()
+
+        margin = 24
+        line_spacing = 6
+        entry_spacing = 16
+        max_text_width = img_w - margin * 2
+
+        measurer = ImageDraw.Draw(annotated)
+
+        header_text = "Legenda probleme identificate"
+        header_bbox = measurer.textbbox((0, 0), header_text, font=header_font)
+        header_h = header_bbox[3] - header_bbox[1]
+
+        line_bbox = measurer.textbbox((0, 0), "Ag", font=text_font)
+        line_h = line_bbox[3] - line_bbox[1]
+
+        entries = []
+        for area in sorted(self.areas, key=lambda a: a["id"]):
+            id_text = f"#{area['id']}"
+            id_bbox = measurer.textbbox((0, 0), id_text, font=id_font)
+            id_w = id_bbox[2] - id_bbox[0]
+            wrap_width = max(60, max_text_width - id_w - 10)
+            wrapped = self._wrap_text_lines(measurer, area["description"], text_font, wrap_width)
+            entries.append((id_text, id_w, wrapped or [""]))
+
+        legend_h = margin + header_h + margin
+        for _, _, wrapped in entries:
+            legend_h += len(wrapped) * (line_h + line_spacing) + entry_spacing
+        legend_h += margin
+
+        final_img = Image.new("RGB", (img_w, img_h + legend_h), "white")
+        final_img.paste(annotated, (0, 0))
+        draw = ImageDraw.Draw(final_img)
+
+        y = img_h + margin
+        draw.text((margin, y), header_text, fill="black", font=header_font)
+        y += header_h + margin
+
+        for id_text, id_w, wrapped in entries:
+            draw.text((margin, y), id_text, fill="red", font=id_font)
+            text_x = margin + id_w + 10
+            for line in wrapped:
+                draw.text((text_x, y), line, fill="black", font=text_font)
+                y += line_h + line_spacing
+            y += entry_spacing
+
+        return final_img
+
+    @staticmethod
+    def _wrap_text_lines(draw, text, font, max_width):
+        """Imparte textul in linii care incap in max_width pixeli la fontul
+        dat, pastrand liniile explicite (\\n) din text si impartind pe
+        cuvinte cele prea lungi ca sa incapa pe latimea imaginii."""
+        lines = []
+        for raw_line in text.splitlines() or [""]:
+            words = raw_line.split(" ")
+            current = ""
+            for word in words:
+                candidate = (current + " " + word).strip()
+                bbox = draw.textbbox((0, 0), candidate, font=font)
+                width = bbox[2] - bbox[0]
+                if width <= max_width or not current:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = word
+            lines.append(current)
+        return lines
 
 
 def choose_image_path():
