@@ -292,6 +292,19 @@ class ProblemAreaSelector:
         self._finish_init()
 
     def _finish_init(self):
+        # Dimensiunea REALA a canvas-ului, actualizata dinamic la redimensionare
+        # (vezi on_canvas_resize). VIEWPORT_WIDTH/HEIGHT raman doar valorile
+        # initiale - daca fereastra e marita/fullscreen, self.viewport_width/
+        # height se actualizeaza si toate calculele de randare (zona vizibila,
+        # crop, OVERSCAN) urmeaza noua dimensiune. Fara asta, la fullscreen
+        # canvas-ul (widget-ul Tk) se marea vizual, dar bitmap-ul randat
+        # ramanea la dimensiunea veche, mica - restul ferestrei ramanea gri
+        # PERMANENT, si bufferul (dimensionat tot pentru fereastra mica)
+        # devenea insuficient si pentru interactiune, aducand inapoi si
+        # problemele de lag/zona gri deja rezolvate la dimensiunea originala.
+        self.viewport_width = VIEWPORT_WIDTH
+        self.viewport_height = VIEWPORT_HEIGHT
+
         self.base_scale = self._compute_fit_scale(self.original_image.size)
         self.zoom_factor = 1.0
         self.scale = self.base_scale * self.zoom_factor
@@ -371,9 +384,16 @@ class ProblemAreaSelector:
     # Construire UI
 
     def _compute_fit_scale(self, size):
+        """Scala la care planul "incape" complet in canvas (folosita ca
+        referinta pentru zoom_factor=1.0/100%). Foloseste dimensiunea REALA
+        curenta a canvas-ului (self.viewport_width/height), nu constantele
+        initiale - ca planul sa se rescaleze corect (proportional cu
+        zoom_factor-ul curent) cand fereastra e redimensionata/maximizata,
+        in loc sa ramana la dimensiunea veche, mica, intr-o fereastra mare
+        (exact situatia care lasa restul canvas-ului gri permanent)."""
         w, h = size
-        scale_w = VIEWPORT_WIDTH / w
-        scale_h = VIEWPORT_HEIGHT / h
+        scale_w = self.viewport_width / w
+        scale_h = self.viewport_height / h
         return min(1.0, scale_w, scale_h)
 
     def _build_ui(self):
@@ -438,6 +458,11 @@ class ProblemAreaSelector:
 
         self.status = tk.Label(self.root, text="Zone selectate: 0", anchor="w")
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Urmarim dimensiunea REALA a canvas-ului (se schimba la redimensionarea
+        # ferestrei/fullscreen, chiar daca VIEWPORT_WIDTH/HEIGHT raman fixe -
+        # canvas-ul e "sticky=nsew" cu weight=1, deci Tk il intinde automat).
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
 
         # Click stanga + tragere = navigare libera prin desen (pan), ca in AutoCAD
         self.canvas.bind("<ButtonPress-1>", self.on_pan_start)
@@ -518,8 +543,50 @@ class ProblemAreaSelector:
 
     def _visible_size_in_original(self):
         """Latimea/inaltimea (in pixeli din imaginea ORIGINALA) pe care o
-        acopera viewport-ul la zoom-ul curent."""
-        return VIEWPORT_WIDTH / self.scale, VIEWPORT_HEIGHT / self.scale
+        acopera viewport-ul la zoom-ul curent. Foloseste dimensiunea REALA,
+        curenta a canvas-ului (self.viewport_width/height), nu constantele
+        initiale - altfel la fullscreen/redimensionare bitmap-ul randat ar
+        ramane la dimensiunea veche, mica, iar restul canvas-ului ar ramane
+        gri permanent."""
+        return self.viewport_width / self.scale, self.viewport_height / self.scale
+
+    def on_canvas_resize(self, event):
+        """Cand se schimba dimensiunea REALA a canvas-ului (redimensionarea
+        ferestrei, maximizare, fullscreen) - vezi comentariul de la
+        self.viewport_width din _finish_init pentru motivul pentru care asta
+        conteaza. Evenimentul <Configure> poate veni foarte des cat timp
+        utilizatorul trage de marginea ferestrei (sau chiar la simpla mutare
+        a ferestrei, fara schimbare de dimensiune - de-aia verificam explicit
+        daca s-a schimbat ceva), deci randarea grea trece prin acelasi
+        mecanism de debounce/throttle ca zoom-ul si panoramarea."""
+        new_w, new_h = event.width, event.height
+        if new_w == self.viewport_width and new_h == self.viewport_height:
+            return
+
+        # pastram centrul actual (in coordonate imagine originala) fix pe
+        # ecran dupa recalcularea scalei, ca redimensionarea sa nu "sara"
+        old_visible_w, old_visible_h = self._visible_size_in_original()
+        center_x = self.view_x + old_visible_w / 2
+        center_y = self.view_y + old_visible_h / 2
+
+        self.viewport_width = new_w
+        self.viewport_height = new_h
+
+        # planul se rescaleaza proportional cu noua dimensiune a canvas-ului,
+        # pastrand zoom_factor-ul curent - la 100% (fit to window), asta
+        # inseamna ca planul creste/scade odata cu fereastra, ca intr-un
+        # viewer de imagini normal, in loc sa ramana la dimensiunea veche cu
+        # spatiu gol (gri) in jur intr-o fereastra mult mai mare.
+        self.base_scale = self._compute_fit_scale(self.original_image.size)
+        self.scale = self.base_scale * self.zoom_factor
+
+        new_visible_w, new_visible_h = self._visible_size_in_original()
+        self.view_x = center_x - new_visible_w / 2
+        self.view_y = center_y - new_visible_h / 2
+
+        self._clamp_view()
+        self._update_ui_state()
+        self._request_bg_render(delay=80)
 
     def _clamp_view(self):
         w, h = self.original_image.size
@@ -767,8 +834,8 @@ class ProblemAreaSelector:
         if event is not None:
             widget_x, widget_y = event.x, event.y
         else:
-            widget_x = VIEWPORT_WIDTH / 2
-            widget_y = VIEWPORT_HEIGHT / 2
+            widget_x = self.viewport_width / 2
+            widget_y = self.viewport_height / 2
 
         # punctul din imaginea originala aflat sub cursor, ca sa ramana
         # fix pe ecran dupa schimbarea zoom-ului (zoom centrat pe cursor)
