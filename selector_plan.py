@@ -49,19 +49,29 @@ VIEWPORT_WIDTH = 950
 VIEWPORT_HEIGHT = 700
 SIDEBAR_WIDTH = 320
 
-# La cate DPI randam pagina PDF-ului (mai mare = mai clar, dar mai lent)
+# La cate DPI randam pagina PDF-ului daca pagina e mica (mai mare = mai
+# clar). Pentru pagini mari, DPI-ul efectiv scade automat ca sa nu depaseasca
+# PDF_MAX_BASE_DIMENSION - vezi mai jos.
 PDF_RENDER_DPI = 300
+
+# Latura lunga maxima (in pixeli) a rasterului de baza generat dintr-un PDF.
+# PDF-ul se randeaza O SINGURA DATA, la incarcare, la aceasta rezolutie -
+# toate operatiile de zoom/pan de dupa aceea sunt doar crop+resize pe acest
+# raster deja in memorie (rapide si previzibile), NU re-randari succesive din
+# datele vectoriale ale PDF-ului. Randarea vectoriala repetata (o data la
+# fiecare pas de zoom/pan) era principala sursa de lag ramasa pe PDF-uri
+# complexe/CAD, unde randarea unei singure zone poate dura oricat in functie
+# de cate elemente vectoriale contine desenul - imprevizibil si greu de
+# controlat prin debounce/throttle. La zoom peste rezolutia acestui raster,
+# imaginea devine usor neclara (ca la o poza normala marita) - schimb
+# acceptabil pentru o interfata care nu se mai blocheaza deloc.
+PDF_MAX_BASE_DIMENSION = 6000
 
 
 def load_image_from_path(path):
     """Incarca o imagine dintr-un fisier, acceptand atat imagini clasice
-    (png/jpg/etc) cat si PDF (randeaza prima pagina).
-
-    Returneaza (imagine_baza, pdf_page) - pdf_page e None daca fisierul nu
-    e PDF. Cand e PDF, pastram pagina deschisa ca sa o putem rerandeaza
-    direct din datele vectoriale la orice nivel de zoom (claritate maxima,
-    ca in AutoCAD), in loc sa maream un raster deja facut.
-    """
+    (png/jpg/etc) cat si PDF (randeaza prima pagina o singura data, la
+    rezolutie mare, ca un raster obisnuit - vezi PDF_MAX_BASE_DIMENSION)."""
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".pdf":
@@ -75,15 +85,22 @@ def load_image_from_path(path):
             )
         doc = fitz.open(path)
         page = doc[0]  # prima pagina din PDF
-        zoom = PDF_RENDER_DPI / 72  # 72 dpi e rezolutia implicita PDF
+
+        page_w_pt, page_h_pt = page.rect.width, page.rect.height
+        long_side_pt = max(page_w_pt, page_h_pt)
+
+        dpi = PDF_RENDER_DPI
+        if long_side_pt > 0:
+            dpi = min(dpi, PDF_MAX_BASE_DIMENSION / (long_side_pt / 72))
+
+        zoom = dpi / 72
         matrix = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=matrix)
         image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        # NU inchidem documentul - il pastram ca sa putem rerandeaza direct
-        # din datele vectoriale la orice nivel de zoom.
-        return image, page
+        doc.close()
+        return image
 
-    return Image.open(path).convert("RGB"), None
+    return Image.open(path).convert("RGB")
 
 
 class ProblemAreaSelector:
@@ -122,7 +139,7 @@ class ProblemAreaSelector:
         self.root.title("Selector zone cu probleme - " + os.path.basename(image_path))
 
         self.image_path = image_path
-        self.original_image, self.pdf_page = load_image_from_path(image_path)
+        self.original_image = load_image_from_path(image_path)
 
         self.base_scale = self._compute_fit_scale(self.original_image.size)
         self.zoom_factor = 1.0
@@ -144,9 +161,9 @@ class ProblemAreaSelector:
         # "tick" de scroll pentru preview-ul instant).
         self._bg_image_id = None
 
-        # Pentru debounce: randarea grea (crop+resize sau rerandare PDF) nu
-        # se face la fiecare eveniment de mouse, ci e amanata putin, ca sa
-        # nu se blocheze aplicatia la miscari/scroll rapide.
+        # Pentru debounce: randarea grea (crop+resize) nu se face la fiecare
+        # eveniment de mouse, ci e amanata putin, ca sa nu se blocheze
+        # aplicatia la miscari/scroll rapide.
         self._pending_bg_render_id = None
 
         # Ultimul bitmap randat "de calitate" + zona (in coordonate imagine
@@ -157,13 +174,11 @@ class ProblemAreaSelector:
         self._last_bitmap_crop = None
         self._last_bitmap_render_scale = None
 
-        # Randarea grea (crop+resize sau rerandare PDF) ruleaza pe UN SINGUR
-        # thread de fundal, persistent pe toata durata aplicatiei (pornit mai
-        # jos), care ia cereri dintr-o coada. Un singur thread persistent
-        # (in loc sa pornim un thread nou la fiecare cerere) evita costul de
-        # creare/distrugere de threaduri la fiecare eveniment de mouse si
-        # garanteaza structural ca fitz/PyMuPDF nu e niciodata atins din doua
-        # threaduri deodata (nu e sigur de folosit asa).
+        # Randarea grea (crop+resize) ruleaza pe UN SINGUR thread de fundal,
+        # persistent pe toata durata aplicatiei (pornit mai jos), care ia
+        # cereri dintr-o coada. Un singur thread persistent (in loc sa
+        # pornim un thread nou la fiecare cerere) evita costul de
+        # creare/distrugere de threaduri la fiecare eveniment de mouse.
         #
         # Coada tine cel mult 1 element: la o cerere noua, golim orice cerere
         # veche neinceputa inca si punem doar cea mai recenta - nu are rost
@@ -425,15 +440,15 @@ class ProblemAreaSelector:
         mouse/da scroll), folosim un resampling mult mai rapid (BILINEAR in
         loc de LANCZOS) - vizibil putin mai neclar, dar de multe ori mai
         rapid pe crop-uri mari, ceea ce e principalul motiv de lag la
-        panoramare/zoom pe imagini/PDF-uri mari. Cand interactiunea se
-        opreste, urmeaza automat o randare finala cu interactive=False,
-        care aduce claritatea maxima (LANCZOS)."""
+        panoramare/zoom. Cand interactiunea se opreste, urmeaza automat o
+        randare finala cu interactive=False, care aduce claritatea maxima
+        (LANCZOS). Se aplica identic pentru imagini si PDF-uri - PDF-ul e deja
+        randat o singura data la incarcare (vezi load_image_from_path), deci
+        aici e mereu vorba de un simplu crop+resize pe un raster in memorie,
+        niciodata o re-randare din date vectoriale."""
         crop_x0, crop_y0, crop_x1, crop_y1 = crop_params["crop"]
         scale = crop_params["scale"]
         interactive = crop_params.get("interactive", False)
-
-        if self.pdf_page is not None:
-            return self._render_pdf_crop(crop_x0, crop_y0, crop_x1, crop_y1, scale, interactive)
 
         crop = self.original_image.crop(
             (int(crop_x0), int(crop_y0), int(round(crop_x1)), int(round(crop_y1)))
@@ -519,8 +534,7 @@ class ProblemAreaSelector:
 
         Coada tine cel mult 1 cerere: daca vine una noua inainte ca thread-ul
         sa apuce s-o preia pe cea veche, o inlocuim - nu are rost sa randam
-        o stare deja depasita, si asta garanteaza in acelasi timp ca fitz nu
-        e atins niciodata din doua threaduri deodata."""
+        o stare deja depasita."""
         self._last_render_launch_time = time.monotonic()
         crop_params = self._capture_crop_params(interactive=interactive)
 
@@ -557,61 +571,6 @@ class ProblemAreaSelector:
         canvas-ul in siguranta."""
         if resized is not None:
             self._apply_bitmap_result(resized, crop_params)
-
-    # DPI maxim la care randam efectiv din PDF. Peste zoom-uri foarte mari,
-    # randam la acest plafon si doar maream putin rezultatul (PIL), ca sa nu
-    # incarcam fitz cu randari extrem de costisitoare care ar bloca aplicatia.
-    MAX_EFFECTIVE_DPI = 2400
-
-    # Plafon de DPI mult mai mic, folosit DOAR cat timp utilizatorul inca
-    # interactioneaza (drag/scroll/zoom continuu). fitz.get_pixmap() e partea
-    # cea mai scumpa din tot procesul de randare la PDF-uri - la un plafon
-    # mare (MAX_EFFECTIVE_DPI) pe o zona OVERSCAN, o singura randare poate
-    # dura sute de milisecunde sau chiar secunde intregi pe PDF-uri complexe,
-    # ceea ce se simte exact ca lag-ul reclamat la zoom/panoramare. In timpul
-    # interactiunii randam rapid la acest plafon redus (rezultat usor neclar,
-    # dar aproape instant); imediat ce utilizatorul se opreste, urmeaza automat
-    # randarea finala la MAX_EFFECTIVE_DPI.
-    INTERACTIVE_MAX_DPI = 450
-
-    def _render_pdf_crop(self, crop_x0, crop_y0, crop_x1, crop_y1, scale, interactive=False):
-        """Randeaza direct din PDF (fitz) doar zona ceruta, la rezolutia
-        corespunzatoare parametrului `scale` (plafonata la MAX_EFFECTIVE_DPI,
-        sau la INTERACTIVE_MAX_DPI cat timp interactiunea e in desfasurare).
-        crop_* sunt in coordonate 'pixel de baza' (spatiul lui original_image,
-        la PDF_RENDER_DPI). `scale` se primeste explicit (nu se citeste
-        self.scale) ca sa fie sigur de apelat dintr-un thread de fundal, fara
-        sa depinda de o valoare care s-ar putea schimba intre timp pe firul
-        principal."""
-        pt_ratio = PDF_RENDER_DPI / 72  # pixeli-de-baza per punct PDF
-
-        pt_x0 = crop_x0 / pt_ratio
-        pt_y0 = crop_y0 / pt_ratio
-        pt_x1 = crop_x1 / pt_ratio
-        pt_y1 = crop_y1 / pt_ratio
-
-        if pt_x1 <= pt_x0 or pt_y1 <= pt_y0:
-            return Image.new("RGB", (1, 1), "white")
-
-        target_w = max(1, round((crop_x1 - crop_x0) * scale))
-        target_h = max(1, round((crop_y1 - crop_y0) * scale))
-
-        effective_dpi = scale * PDF_RENDER_DPI
-        dpi_ceiling = self.INTERACTIVE_MAX_DPI if interactive else self.MAX_EFFECTIVE_DPI
-        capped_dpi = min(effective_dpi, dpi_ceiling)
-
-        zoom = capped_dpi / 72
-        matrix = fitz.Matrix(zoom, zoom)
-        clip = fitz.Rect(pt_x0, pt_y0, pt_x1, pt_y1)
-
-        pix = self.pdf_page.get_pixmap(matrix=matrix, clip=clip)
-        image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
-        if capped_dpi < effective_dpi:
-            resample = Image.BILINEAR if interactive else Image.LANCZOS
-            image = image.resize((target_w, target_h), resample)
-
-        return image
 
     def _update_scrollbars(self):
         w, h = self.original_image.size
@@ -657,8 +616,8 @@ class ProblemAreaSelector:
         self._clamp_view()
 
         # feedback ieftin si instantaneu (pozitii, procent zoom, scrollbar);
-        # randarea grea (crop/resize sau rerandare PDF) e amanata, ca sa nu
-        # se blocheze aplicatia daca dai scroll rapid de mai multe ori la rand
+        # randarea grea (crop/resize) e amanata, ca sa nu se blocheze
+        # aplicatia daca dai scroll rapid de mai multe ori la rand
         self._update_ui_state()
 
         # repictarea propriu-zisa a preview-ului e plafonata (vezi
@@ -823,8 +782,8 @@ class ProblemAreaSelector:
         self.canvas.move("area", dx, dy)
         self._update_scrollbars()
 
-        # randarea de calitate (crop/resize sau rerandare PDF) e amanata;
-        # daca miscarea continua, cererea veche e anulata si reprogramata
+        # randarea de calitate (crop/resize) e amanata; daca miscarea
+        # continua, cererea veche e anulata si reprogramata
         self._request_bg_render(delay=80)
 
     def on_pan_end(self, event):
