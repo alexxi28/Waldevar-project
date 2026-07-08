@@ -1294,9 +1294,34 @@ class ProblemAreaSelector:
             draw.rectangle([x0, y0, x1, y1], outline="red", width=3)
             draw.text((x0 + 4, max(0, y0 - 22)), f"#{area['id']}", fill="red", font=font)
 
-        final_image = self._add_legend(annotated)
+        cropped = self._crop_to_areas(annotated)
+        final_image = self._add_legend(cropped)
         final_image.save(path)
         messagebox.showinfo("Succes", f"Imaginea adnotata a fost salvata in:\n{path}")
+
+    def _crop_to_areas(self, annotated):
+        """Decupeaza imaginea la conturul (bounding box) zonelor marcate, cu
+        o margine de context in jur - in loc sa pastram toata pagina bruta.
+        Multe PDF-uri au mult spatiu gol si alte elemente in afara desenului
+        propriu-zis (planul mare cu culori/hasuri), ceea ce facea legenda sa
+        para "intr-un colt", minuscula si disproportionata fata de desen.
+        Decupand la desenul relevant, legenda ramane exact deasupra lui."""
+        xs0 = [a["original_coords"][0] for a in self.areas]
+        ys0 = [a["original_coords"][1] for a in self.areas]
+        xs1 = [a["original_coords"][2] for a in self.areas]
+        ys1 = [a["original_coords"][3] for a in self.areas]
+        x0, y0, x1, y1 = min(xs0), min(ys0), max(xs1), max(ys1)
+
+        pad_x = max(60, round((x1 - x0) * 0.08))
+        pad_y = max(60, round((y1 - y0) * 0.08))
+
+        img_w, img_h = annotated.size
+        crop_x0 = max(0, round(x0 - pad_x))
+        crop_y0 = max(0, round(y0 - pad_y))
+        crop_x1 = min(img_w, round(x1 + pad_x))
+        crop_y1 = min(img_h, round(y1 + pad_y))
+
+        return annotated.crop((crop_x0, crop_y0, crop_x1, crop_y1))
 
     def _add_legend(self, annotated):
         """Adauga DEASUPRA imaginii adnotate o legenda cu descrierea fiecarei
