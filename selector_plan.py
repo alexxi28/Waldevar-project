@@ -27,6 +27,7 @@ Zoom:
 
 import json
 import os
+import queue
 import threading
 import time
 import tkinter as tk
@@ -99,13 +100,22 @@ class ProblemAreaSelector:
     # pana vine urmatoarea randare de calitate.
     OVERSCAN = 2.0
 
-    # La cel mult atatea secunde una de alta, lansam o randare de calitate
-    # chiar daca interactiunea (drag/scroll/zoom) e inca in desfasurare - nu
+    # La cel mult atatea secunde una de alta, lansam o randare noua chiar
+    # daca interactiunea (drag/scroll/zoom) e inca in desfasurare - nu
     # asteptam neaparat sa se opreasca mouse-ul. Fara asta, un pan/scroll
     # continuu si lung reseteaza mereu debounce-ul si bufferul OVERSCAN nu se
     # mai reimprospateaza deloc pana la eliberarea mouse-ului, ceea ce e
     # motivul principal pentru care apare zona gri la miscari mari.
     RENDER_THROTTLE_INTERVAL = 0.15
+
+    # La fel ca RENDER_THROTTLE_INTERVAL, dar pentru preview-ul instant de
+    # zoom (_show_zoom_preview). Repictarea canvas-ului (incarcarea unui
+    # bitmap nou in Tk) costa cateva zeci de ms - la un scroll rapid cu multe
+    # "notch"-uri pe secunda (rotita fizica de mouse sau trackpad), a face
+    # asta la FIECARE notch acumuleaza si se simte exact ca lag-ul reclamat
+    # la zoom. Starea (zoom_factor/scale/view) tot se actualizeaza instant la
+    # fiecare eveniment - doar repictarea propriu-zisa e plafonata.
+    PREVIEW_THROTTLE_INTERVAL = 0.05
 
     def __init__(self, root, image_path):
         self.root = root
@@ -125,6 +135,15 @@ class ProblemAreaSelector:
         self.view_x = 0.0
         self.view_y = 0.0
 
+        # Id-ul item-ului de canvas care afiseaza bitmap-ul de fundal. Creat
+        # o singura data si apoi doar repozitionat/reincarcat cu imagine noua
+        # (itemconfig + coords), NU sters si recreat la fiecare cadru -
+        # create_image()/delete() pe canvas Tk sunt surprinzator de scumpe
+        # (cateva zeci de ms per apel s-a masurat cu profiler-ul), ceea ce
+        # era principala sursa de sacadare la zoom rapid (se apela la fiecare
+        # "tick" de scroll pentru preview-ul instant).
+        self._bg_image_id = None
+
         # Pentru debounce: randarea grea (crop+resize sau rerandare PDF) nu
         # se face la fiecare eveniment de mouse, ci e amanata putin, ca sa
         # nu se blocheze aplicatia la miscari/scroll rapide.
@@ -138,16 +157,31 @@ class ProblemAreaSelector:
         self._last_bitmap_crop = None
         self._last_bitmap_render_scale = None
 
-        # Randarea grea (crop+resize sau rerandare PDF) ruleaza pe un thread
-        # separat, ca sa nu blocheze interfata. Aceste flag-uri asigura ca
-        # nu pornim niciodata doua randari simultan (fitz nu e sigur de
-        # folosit din mai multe threaduri deodata) - daca vine o cerere noua
-        # cat una e in curs, doar o marcam "dirty" si o reluam imediat dupa.
-        self._render_busy = False
-        self._render_dirty = False
-        # Momentul (time.monotonic) la care a fost lansata ultima randare de
-        # calitate - folosit pentru throttle in _request_bg_render().
+        # Randarea grea (crop+resize sau rerandare PDF) ruleaza pe UN SINGUR
+        # thread de fundal, persistent pe toata durata aplicatiei (pornit mai
+        # jos), care ia cereri dintr-o coada. Un singur thread persistent
+        # (in loc sa pornim un thread nou la fiecare cerere) evita costul de
+        # creare/distrugere de threaduri la fiecare eveniment de mouse si
+        # garanteaza structural ca fitz/PyMuPDF nu e niciodata atins din doua
+        # threaduri deodata (nu e sigur de folosit asa).
+        #
+        # Coada tine cel mult 1 element: la o cerere noua, golim orice cerere
+        # veche neinceputa inca si punem doar cea mai recenta - nu are rost
+        # sa randam o stare deja depasita.
+        # Semnalizeaza thread-ului de fundal ca fereastra se inchide, ca sa nu
+        # mai incerce sa predea un rezultat catre un root deja distrus.
+        self._closing = threading.Event()
+
+        self._render_queue = queue.Queue(maxsize=1)
+        self._render_thread = threading.Thread(target=self._render_worker_loop, daemon=True)
+        self._render_thread.start()
+
+        # Momentul (time.monotonic) la care a fost lansata ultima randare -
+        # folosit pentru throttle in _request_bg_render().
         self._last_render_launch_time = None
+        # Momentul (time.monotonic) la care s-a repictat ultima oara preview-ul
+        # de zoom - folosit pentru throttle in zoom() / _show_zoom_preview().
+        self._last_preview_paint_time = None
 
         # Lista de zone. Fiecare element e un dict cu:
         #   id, description, original_coords [x0,y0,x1,y1] in imaginea originala
@@ -269,6 +303,14 @@ class ProblemAreaSelector:
         self.root.bind("<Control-minus>", lambda e: self.zoom(self.ZOOM_STEP_OUT))
         self.root.bind("<Control-0>", lambda e: self.reset_zoom())
 
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        # opreste thread-ul de fundal INAINTE sa distrugem fereastra, ca sa
+        # nu mai incerce sa predea un rezultat catre un root deja disparut
+        self._closing.set()
+        self.root.destroy()
+
     def _build_sidebar(self, parent):
         sidebar = tk.Frame(parent, width=SIDEBAR_WIDTH)
         sidebar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -347,11 +389,15 @@ class ProblemAreaSelector:
         self._update_scrollbars()
         self._redraw_areas()
 
-    def _capture_crop_params(self):
+    def _capture_crop_params(self, interactive=False):
         """Calculeaza zona (in coordonate imagine originala) care trebuie
         randata, incluzand marginea OVERSCAN, plus scala curenta - tot ce
         e nevoie pentru a produce bitmap-ul, capturat ca o "poza" a starii
-        curente (sigur de trecut si intr-un thread de fundal)."""
+        curente (sigur de trecut si intr-un thread de fundal).
+
+        `interactive=True` marcheaza o randare ceruta CAT TIMP utilizatorul
+        inca trage de mouse/da scroll (nu s-a oprit inca) - vezi
+        _produce_bitmap() pentru ce inseamna asta in practica."""
         w, h = self.original_image.size
         visible_w, visible_h = self._visible_size_in_original()
 
@@ -363,25 +409,39 @@ class ProblemAreaSelector:
         crop_x1 = min(w, self.view_x + visible_w + margin_w)
         crop_y1 = min(h, self.view_y + visible_h + margin_h)
 
-        return {"crop": (crop_x0, crop_y0, crop_x1, crop_y1), "scale": self.scale}
+        return {
+            "crop": (crop_x0, crop_y0, crop_x1, crop_y1),
+            "scale": self.scale,
+            "interactive": interactive,
+        }
 
     def _produce_bitmap(self, crop_params):
         """Partea scumpa, dar PURA (nu atinge self.view_x/self.scale/canvas):
         produce bitmap-ul PIL pentru crop_params dati. Poate fi apelata direct
         (randare sincrona) sau dintr-un thread de fundal (randare asincrona),
-        pentru ca nu modifica nicio stare comuna in timp ce ruleaza."""
+        pentru ca nu modifica nicio stare comuna in timp ce ruleaza.
+
+        Cand crop_params["interactive"] e True (utilizatorul inca trage de
+        mouse/da scroll), folosim un resampling mult mai rapid (BILINEAR in
+        loc de LANCZOS) - vizibil putin mai neclar, dar de multe ori mai
+        rapid pe crop-uri mari, ceea ce e principalul motiv de lag la
+        panoramare/zoom pe imagini/PDF-uri mari. Cand interactiunea se
+        opreste, urmeaza automat o randare finala cu interactive=False,
+        care aduce claritatea maxima (LANCZOS)."""
         crop_x0, crop_y0, crop_x1, crop_y1 = crop_params["crop"]
         scale = crop_params["scale"]
+        interactive = crop_params.get("interactive", False)
 
         if self.pdf_page is not None:
-            return self._render_pdf_crop(crop_x0, crop_y0, crop_x1, crop_y1, scale)
+            return self._render_pdf_crop(crop_x0, crop_y0, crop_x1, crop_y1, scale, interactive)
 
         crop = self.original_image.crop(
             (int(crop_x0), int(crop_y0), int(round(crop_x1)), int(round(crop_y1)))
         )
         target_w = max(1, round((crop_x1 - crop_x0) * scale))
         target_h = max(1, round((crop_y1 - crop_y0) * scale))
-        return crop.resize((target_w, target_h), Image.LANCZOS)
+        resample = Image.BILINEAR if interactive else Image.LANCZOS
+        return crop.resize((target_w, target_h), resample)
 
     def _apply_bitmap_result(self, resized, crop_params):
         """Aplica un bitmap deja produs: il retine ca 'ultimul bitmap bun'
@@ -395,102 +455,129 @@ class ProblemAreaSelector:
     def _show_bitmap(self, pil_image, crop_x0, crop_y0):
         """Afiseaza pe canvas un bitmap deja pregatit (PIL Image), pozitionat
         astfel incat coltul (crop_x0, crop_y0) - in coordonate ale imaginii
-        originale - sa cada exact unde trebuie fata de view-ul curent."""
+        originale - sa cada exact unde trebuie fata de view-ul curent.
+
+        Reutilizeaza acelasi item de canvas (itemconfig + coords) in loc sa
+        stearga si sa recreeze imaginea de fiecare data - vezi comentariul de
+        la self._bg_image_id in __init__ pentru motiv."""
         self.tk_image = ImageTk.PhotoImage(pil_image)
 
         offset_x = (crop_x0 - self.view_x) * self.scale
         offset_y = (crop_y0 - self.view_y) * self.scale
 
-        self.canvas.delete("bg")
-        self.canvas.create_image(offset_x, offset_y, anchor=tk.NW, image=self.tk_image, tags="bg")
-        self.canvas.tag_lower("bg")
+        if self._bg_image_id is None:
+            self._bg_image_id = self.canvas.create_image(
+                offset_x, offset_y, anchor=tk.NW, image=self.tk_image, tags="bg"
+            )
+            self.canvas.tag_lower("bg")
+        else:
+            self.canvas.itemconfig(self._bg_image_id, image=self.tk_image)
+            self.canvas.coords(self._bg_image_id, offset_x, offset_y)
 
     def _request_bg_render(self, delay=80):
-        """Amana randarea grea cu `delay` ms. Daca se cere din nou inainte
-        sa treaca timpul, anuleaza cererea veche - deci in timpul unui
-        drag/scroll continuu nu se face o randare la fiecare eveniment de
-        mouse (asta rezolva blocajele).
+        """Cerere de randare in timpul unei interactiuni continue
+        (drag/scroll/zoom). Doua lucruri se intampla:
 
-        Insa nu e un debounce "pur": daca a trecut deja
-        RENDER_THROTTLE_INTERVAL de la ultima randare lansata, pornim una
-        ACUM, nu asteptam sa se opreasca de tot interactiunea. Altfel, la un
-        drag/scroll continuu si lung (multa suprafata parcursa), timer-ul de
-        debounce s-ar reseta la nesfarsit si bufferul OVERSCAN nu s-ar mai
-        reimprospata deloc pana la eliberarea mouse-ului - exact motivul
-        pentru care apare zona gri si senzatia de lag la miscari mari."""
+        1. Se lanseaza IMEDIAT o randare RAPIDA/interactiva (calitate redusa,
+           vezi _produce_bitmap), dar doar daca a trecut deja
+           RENDER_THROTTLE_INTERVAL de la ultima randare lansata - asta tine
+           bufferul OVERSCAN reimprospatat CAT TIMP interactiunea continua,
+           nu doar la final. Fara asta, un drag/scroll continuu si lung ar
+           reseta mereu orice debounce si bufferul nu s-ar mai reimprospata
+           deloc pana la eliberarea mouse-ului - motivul principal pentru
+           care aparea zona gri la miscari mari.
+        2. Se (re)programeaza o randare FINALA de calitate maxima peste
+           `delay` ms - daca intre timp mai vine o cerere, cea veche se
+           anuleaza si se reprogrameaza. Cand utilizatorul chiar se opreste,
+           aceasta e cea care aduce imaginea la claritate maxima."""
         if self._pending_bg_render_id is not None:
             self.root.after_cancel(self._pending_bg_render_id)
-            self._pending_bg_render_id = None
+        self._pending_bg_render_id = self.root.after(delay, self._do_scheduled_bg_render)
 
         now = time.monotonic()
         if (
-            self._last_render_launch_time is not None
-            and (now - self._last_render_launch_time) < self.RENDER_THROTTLE_INTERVAL
+            self._last_render_launch_time is None
+            or (now - self._last_render_launch_time) >= self.RENDER_THROTTLE_INTERVAL
         ):
-            self._pending_bg_render_id = self.root.after(delay, self._do_scheduled_bg_render)
-        else:
-            self._do_scheduled_bg_render()
+            self._launch_bg_render(interactive=True)
 
     def _do_scheduled_bg_render(self):
+        """Randarea "de coada": porneste doar daca timp de `delay` ms nu a
+        mai venit nicio alta cerere - adica interactiunea chiar s-a oprit.
+        Intotdeauna la calitate maxima (interactive=False)."""
         self._pending_bg_render_id = None
         self._clamp_view()
         self._update_ui_state()
-        self._launch_bg_render()
+        self._launch_bg_render(interactive=False)
 
-    def _launch_bg_render(self):
-        """Porneste randarea grea PE UN THREAD SEPARAT, ca sa nu blocheze
-        deloc interfata (asta era motivul pentru care aplicatia "ingheta"
-        vizibil la zoom mare + panoramare mare: randarea sincrona putea dura
-        sute de milisecunde, timp in care fereastra nu raspundea deloc).
+    def _launch_bg_render(self, interactive=False):
+        """Trimite o cerere de randare in coada thread-ului de fundal
+        persistent, ca sa nu blocheze deloc interfata (asta era motivul
+        pentru care aplicatia "ingheta" vizibil la zoom mare + panoramare
+        mare: randarea sincrona putea dura sute de milisecunde, timp in care
+        fereastra nu raspundea deloc).
 
-        Se ruleaza un singur randare o data - daca vine o cerere noua cat
-        timp una e deja in curs, nu pornim un al doilea thread (fitz/PyMuPDF
-        nu e sigur de folosit din doua threaduri simultan), ci doar marcam
-        ca mai trebuie o randare, care porneste imediat ce se termina cea
-        curenta, cu parametrii cei mai recenti."""
+        Coada tine cel mult 1 cerere: daca vine una noua inainte ca thread-ul
+        sa apuce s-o preia pe cea veche, o inlocuim - nu are rost sa randam
+        o stare deja depasita, si asta garanteaza in acelasi timp ca fitz nu
+        e atins niciodata din doua threaduri deodata."""
         self._last_render_launch_time = time.monotonic()
+        crop_params = self._capture_crop_params(interactive=interactive)
 
-        if self._render_busy:
-            self._render_dirty = True
-            return
-
-        self._render_busy = True
-        self._render_dirty = False
-        crop_params = self._capture_crop_params()
-        thread = threading.Thread(
-            target=self._bg_render_worker, args=(crop_params,), daemon=True
-        )
-        thread.start()
-
-    def _bg_render_worker(self, crop_params):
-        """Ruleaza PE THREAD-UL DE FUNDAL. Nu atinge widget-uri Tkinter direct
-        (nu e permis din alt thread) - doar calculeaza bitmap-ul, apoi preda
-        rezultatul inapoi firului principal prin root.after()."""
         try:
-            resized = self._produce_bitmap(crop_params)
-        except Exception:
-            resized = None
-        self.root.after(0, self._on_bg_render_done, resized, crop_params)
+            while True:
+                self._render_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._render_queue.put(crop_params)
+
+    def _render_worker_loop(self):
+        """Ruleaza PE THREAD-UL DE FUNDAL, o singura data pentru toata durata
+        aplicatiei. Asteapta cereri in coada si le proceseaza una cate una -
+        nu atinge widget-uri Tkinter direct (nu e permis din alt thread),
+        doar calculeaza bitmap-ul, apoi preda rezultatul inapoi firului
+        principal prin root.after()."""
+        while True:
+            crop_params = self._render_queue.get()
+            if self._closing.is_set():
+                return
+            try:
+                resized = self._produce_bitmap(crop_params)
+            except Exception:
+                resized = None
+            if self._closing.is_set():
+                return
+            try:
+                self.root.after(0, self._on_bg_render_done, resized, crop_params)
+            except RuntimeError:
+                return  # fereastra a fost inchisa chiar in acest interval
 
     def _on_bg_render_done(self, resized, crop_params):
         """Ruleaza pe firul principal (via root.after), deci poate atinge
         canvas-ul in siguranta."""
-        self._render_busy = False
         if resized is not None:
             self._apply_bitmap_result(resized, crop_params)
-
-        if self._render_dirty:
-            self._render_dirty = False
-            self._launch_bg_render()
 
     # DPI maxim la care randam efectiv din PDF. Peste zoom-uri foarte mari,
     # randam la acest plafon si doar maream putin rezultatul (PIL), ca sa nu
     # incarcam fitz cu randari extrem de costisitoare care ar bloca aplicatia.
     MAX_EFFECTIVE_DPI = 2400
 
-    def _render_pdf_crop(self, crop_x0, crop_y0, crop_x1, crop_y1, scale):
+    # Plafon de DPI mult mai mic, folosit DOAR cat timp utilizatorul inca
+    # interactioneaza (drag/scroll/zoom continuu). fitz.get_pixmap() e partea
+    # cea mai scumpa din tot procesul de randare la PDF-uri - la un plafon
+    # mare (MAX_EFFECTIVE_DPI) pe o zona OVERSCAN, o singura randare poate
+    # dura sute de milisecunde sau chiar secunde intregi pe PDF-uri complexe,
+    # ceea ce se simte exact ca lag-ul reclamat la zoom/panoramare. In timpul
+    # interactiunii randam rapid la acest plafon redus (rezultat usor neclar,
+    # dar aproape instant); imediat ce utilizatorul se opreste, urmeaza automat
+    # randarea finala la MAX_EFFECTIVE_DPI.
+    INTERACTIVE_MAX_DPI = 450
+
+    def _render_pdf_crop(self, crop_x0, crop_y0, crop_x1, crop_y1, scale, interactive=False):
         """Randeaza direct din PDF (fitz) doar zona ceruta, la rezolutia
-        corespunzatoare parametrului `scale` (plafonata la MAX_EFFECTIVE_DPI).
+        corespunzatoare parametrului `scale` (plafonata la MAX_EFFECTIVE_DPI,
+        sau la INTERACTIVE_MAX_DPI cat timp interactiunea e in desfasurare).
         crop_* sunt in coordonate 'pixel de baza' (spatiul lui original_image,
         la PDF_RENDER_DPI). `scale` se primeste explicit (nu se citeste
         self.scale) ca sa fie sigur de apelat dintr-un thread de fundal, fara
@@ -510,7 +597,8 @@ class ProblemAreaSelector:
         target_h = max(1, round((crop_y1 - crop_y0) * scale))
 
         effective_dpi = scale * PDF_RENDER_DPI
-        capped_dpi = min(effective_dpi, self.MAX_EFFECTIVE_DPI)
+        dpi_ceiling = self.INTERACTIVE_MAX_DPI if interactive else self.MAX_EFFECTIVE_DPI
+        capped_dpi = min(effective_dpi, dpi_ceiling)
 
         zoom = capped_dpi / 72
         matrix = fitz.Matrix(zoom, zoom)
@@ -520,7 +608,8 @@ class ProblemAreaSelector:
         image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
         if capped_dpi < effective_dpi:
-            image = image.resize((target_w, target_h), Image.LANCZOS)
+            resample = Image.BILINEAR if interactive else Image.LANCZOS
+            image = image.resize((target_w, target_h), resample)
 
         return image
 
@@ -571,7 +660,20 @@ class ProblemAreaSelector:
         # randarea grea (crop/resize sau rerandare PDF) e amanata, ca sa nu
         # se blocheze aplicatia daca dai scroll rapid de mai multe ori la rand
         self._update_ui_state()
-        self._show_zoom_preview()
+
+        # repictarea propriu-zisa a preview-ului e plafonata (vezi
+        # PREVIEW_THROTTLE_INTERVAL) - la un scroll foarte rapid, unele
+        # "notch"-uri intermediare nu mai declanseaza o repictare separata,
+        # dar starea de zoom ramane mereu corecta si randarea finala de
+        # calitate tot vine (vezi _request_bg_render mai jos)
+        now = time.monotonic()
+        if (
+            self._last_preview_paint_time is None
+            or (now - self._last_preview_paint_time) >= self.PREVIEW_THROTTLE_INTERVAL
+        ):
+            self._last_preview_paint_time = now
+            self._show_zoom_preview()
+
         self._request_bg_render(delay=100)
 
     def _show_zoom_preview(self):
