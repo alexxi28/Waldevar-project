@@ -28,6 +28,7 @@ Zoom:
 import json
 import os
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageTk, ImageDraw, ImageFont
@@ -92,11 +93,19 @@ class ProblemAreaSelector:
     ZOOM_STEP_OUT = 0.8
 
     # Cat de mult mai mare randam bitmap-ul de fundal fata de viewport-ul
-    # vizibil (1.6 = 60% in plus pe fiecare dimensiune). Acest "buffer" in
+    # vizibil (2.0 = 100% in plus pe fiecare dimensiune). Acest "buffer" in
     # jurul zonei vizibile face ca o panoramare rapida sa nu iasa imediat
     # in zona gri neandata - ai ceva "rezerva" de imagine deja randata
     # pana vine urmatoarea randare de calitate.
-    OVERSCAN = 1.6
+    OVERSCAN = 2.0
+
+    # La cel mult atatea secunde una de alta, lansam o randare de calitate
+    # chiar daca interactiunea (drag/scroll/zoom) e inca in desfasurare - nu
+    # asteptam neaparat sa se opreasca mouse-ul. Fara asta, un pan/scroll
+    # continuu si lung reseteaza mereu debounce-ul si bufferul OVERSCAN nu se
+    # mai reimprospateaza deloc pana la eliberarea mouse-ului, ceea ce e
+    # motivul principal pentru care apare zona gri la miscari mari.
+    RENDER_THROTTLE_INTERVAL = 0.15
 
     def __init__(self, root, image_path):
         self.root = root
@@ -136,6 +145,9 @@ class ProblemAreaSelector:
         # cat una e in curs, doar o marcam "dirty" si o reluam imediat dupa.
         self._render_busy = False
         self._render_dirty = False
+        # Momentul (time.monotonic) la care a fost lansata ultima randare de
+        # calitate - folosit pentru throttle in _request_bg_render().
+        self._last_render_launch_time = None
 
         # Lista de zone. Fiecare element e un dict cu:
         #   id, description, original_coords [x0,y0,x1,y1] in imaginea originala
@@ -396,11 +408,28 @@ class ProblemAreaSelector:
     def _request_bg_render(self, delay=80):
         """Amana randarea grea cu `delay` ms. Daca se cere din nou inainte
         sa treaca timpul, anuleaza cererea veche - deci in timpul unui
-        drag/scroll continuu se face o singura randare finala, nu una la
-        fiecare eveniment de mouse (asta rezolva blocajele)."""
+        drag/scroll continuu nu se face o randare la fiecare eveniment de
+        mouse (asta rezolva blocajele).
+
+        Insa nu e un debounce "pur": daca a trecut deja
+        RENDER_THROTTLE_INTERVAL de la ultima randare lansata, pornim una
+        ACUM, nu asteptam sa se opreasca de tot interactiunea. Altfel, la un
+        drag/scroll continuu si lung (multa suprafata parcursa), timer-ul de
+        debounce s-ar reseta la nesfarsit si bufferul OVERSCAN nu s-ar mai
+        reimprospata deloc pana la eliberarea mouse-ului - exact motivul
+        pentru care apare zona gri si senzatia de lag la miscari mari."""
         if self._pending_bg_render_id is not None:
             self.root.after_cancel(self._pending_bg_render_id)
-        self._pending_bg_render_id = self.root.after(delay, self._do_scheduled_bg_render)
+            self._pending_bg_render_id = None
+
+        now = time.monotonic()
+        if (
+            self._last_render_launch_time is not None
+            and (now - self._last_render_launch_time) < self.RENDER_THROTTLE_INTERVAL
+        ):
+            self._pending_bg_render_id = self.root.after(delay, self._do_scheduled_bg_render)
+        else:
+            self._do_scheduled_bg_render()
 
     def _do_scheduled_bg_render(self):
         self._pending_bg_render_id = None
@@ -419,6 +448,8 @@ class ProblemAreaSelector:
         nu e sigur de folosit din doua threaduri simultan), ci doar marcam
         ca mai trebuie o randare, care porneste imediat ce se termina cea
         curenta, cu parametrii cei mai recenti."""
+        self._last_render_launch_time = time.monotonic()
+
         if self._render_busy:
             self._render_dirty = True
             return
