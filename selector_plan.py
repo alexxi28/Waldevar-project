@@ -34,6 +34,13 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 
+# Planurile mari (mai ales PDF-uri randate la rezolutie mare - vezi
+# PDF_MAX_BASE_PIXELS) pot depasi limita implicita de "decompression bomb" a
+# Pillow, gandita pentru fisiere nesigure/necunoscute. Aici marimea e produsa
+# chiar de noi, deliberat si controlat prin PDF_MAX_BASE_PIXELS - dezactivam
+# deci verificarea Pillow, ca sa nu riscam o eroare la un plan legitim, mare.
+Image.MAX_IMAGE_PIXELS = None
+
 try:
     import fitz  # PyMuPDF, folosit pentru citirea fisierelor PDF
     PDF_SUPPORT = True
@@ -49,29 +56,35 @@ VIEWPORT_WIDTH = 950
 VIEWPORT_HEIGHT = 700
 SIDEBAR_WIDTH = 320
 
-# La cate DPI randam pagina PDF-ului daca pagina e mica (mai mare = mai
-# clar). Pentru pagini mari, DPI-ul efectiv scade automat ca sa nu depaseasca
-# PDF_MAX_BASE_DIMENSION - vezi mai jos.
-PDF_RENDER_DPI = 300
+# Bugetul total de pixeli (latime x inaltime) pentru rasterul de baza produs
+# dintr-un PDF. PDF-ul se randeaza O SINGURA DATA, la incarcare, la cel mai
+# mare DPI care se incadreaza in acest buget - toate operatiile de zoom/pan
+# de dupa aceea sunt doar crop+resize pe acest raster deja in memorie (rapide
+# si previzibile, indiferent de complexitatea desenului), NU re-randari
+# succesive din datele vectoriale ale PDF-ului. Randarea vectoriala repetata
+# (o data la fiecare pas de zoom/pan) era principala sursa de lag ramasa pe
+# PDF-uri complexe/CAD cu foarte multe elemente vectoriale (linii, hasuri) -
+# acolo o singura randare poate dura cateva SECUNDE, imprevizibil si
+# imposibil de absorbit prin debounce/throttle.
+#
+# Bazat pe numarul TOTAL de pixeli (nu pe DPI fix) ca sa se adapteze automat
+# atat la pagini mici cat si la coli foarte mari (A0 etc.) - memoria si
+# timpul de randare raman aproximativ constante indiferent de dimensiunea
+# fizica a paginii. 100 milioane de pixeli inseamna cca. 300MB in memorie
+# (RGB needat) si, pe un plan complex, cateva secunde la incarcare - cost
+# UNIC, platit o singura data la deschiderea fisierului (vezi ecranul de
+# "Se incarca..." din ProblemAreaSelector), nu la fiecare zoom/pan.
+PDF_MAX_BASE_PIXELS = 100_000_000
 
-# Latura lunga maxima (in pixeli) a rasterului de baza generat dintr-un PDF.
-# PDF-ul se randeaza O SINGURA DATA, la incarcare, la aceasta rezolutie -
-# toate operatiile de zoom/pan de dupa aceea sunt doar crop+resize pe acest
-# raster deja in memorie (rapide si previzibile), NU re-randari succesive din
-# datele vectoriale ale PDF-ului. Randarea vectoriala repetata (o data la
-# fiecare pas de zoom/pan) era principala sursa de lag ramasa pe PDF-uri
-# complexe/CAD, unde randarea unei singure zone poate dura oricat in functie
-# de cate elemente vectoriale contine desenul - imprevizibil si greu de
-# controlat prin debounce/throttle. La zoom peste rezolutia acestui raster,
-# imaginea devine usor neclara (ca la o poza normala marita) - schimb
-# acceptabil pentru o interfata care nu se mai blocheaza deloc.
-PDF_MAX_BASE_DIMENSION = 6000
+# Nu are sens sa randam mai clar de-atat - dincolo de acest DPI, mupdf/fitz
+# incepe sa refuze randarea ("Overly large image") pe pagini mici oricum.
+PDF_MAX_DPI = 1200
 
 
 def load_image_from_path(path):
     """Incarca o imagine dintr-un fisier, acceptand atat imagini clasice
     (png/jpg/etc) cat si PDF (randeaza prima pagina o singura data, la
-    rezolutie mare, ca un raster obisnuit - vezi PDF_MAX_BASE_DIMENSION)."""
+    rezolutie mare, ca un raster obisnuit - vezi PDF_MAX_BASE_PIXELS)."""
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".pdf":
@@ -86,18 +99,29 @@ def load_image_from_path(path):
         doc = fitz.open(path)
         page = doc[0]  # prima pagina din PDF
 
-        page_w_pt, page_h_pt = page.rect.width, page.rect.height
-        long_side_pt = max(page_w_pt, page_h_pt)
+        page_w_in = page.rect.width / 72
+        page_h_in = page.rect.height / 72
+        page_area_in2 = page_w_in * page_h_in
 
-        dpi = PDF_RENDER_DPI
-        if long_side_pt > 0:
-            dpi = min(dpi, PDF_MAX_BASE_DIMENSION / (long_side_pt / 72))
+        dpi = PDF_MAX_DPI
+        if page_area_in2 > 0:
+            dpi = min(dpi, (PDF_MAX_BASE_PIXELS / page_area_in2) ** 0.5)
 
-        zoom = dpi / 72
-        matrix = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=matrix)
-        image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        # daca fitz tot refuza (pagina neobisnuit de mare/complexa), incercam
+        # progresiv mai mic in loc sa crapam aplicatia la deschiderea fisierului
+        image = None
+        for attempt_dpi in (dpi, dpi * 0.6, dpi * 0.35, dpi * 0.2):
+            try:
+                zoom = attempt_dpi / 72
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                break
+            except Exception:
+                continue
         doc.close()
+
+        if image is None:
+            raise RuntimeError("Pagina PDF e prea mare/complexa pentru a fi randata.")
         return image
 
     return Image.open(path).convert("RGB")
@@ -106,7 +130,12 @@ def load_image_from_path(path):
 class ProblemAreaSelector:
 
     MIN_ZOOM = 0.2
-    MAX_ZOOM = 20.0
+    # Marit mult (de la 20x): cum crop+resize costa la fel indiferent de
+    # nivelul de zoom (bufferul randat are mereu marimea viewport-ului),
+    # zoom-ul mare nu costa nimic in plus la viteza - doar la claritate
+    # (dincolo de rezolutia rasterului de baza, imaginea devine usor neclara,
+    # dar ramane complet utilizabila pentru inspectie detaliata).
+    MAX_ZOOM = 100.0
     ZOOM_STEP_IN = 1.25
     ZOOM_STEP_OUT = 0.8
 
@@ -137,10 +166,72 @@ class ProblemAreaSelector:
     def __init__(self, root, image_path):
         self.root = root
         self.root.title("Selector zone cu probleme - " + os.path.basename(image_path))
-
         self.image_path = image_path
-        self.original_image = load_image_from_path(image_path)
 
+        # Incarcarea/randarea fisierului (mai ales un PDF complex - vezi
+        # PDF_MAX_BASE_PIXELS) poate dura cateva secunde. E un cost UNIC, dar
+        # daca l-am face sincron aici, fereastra ar aparea "inghetata" chiar
+        # de la pornire, ceea ce se simte exact ca lag-ul reclamat - chiar
+        # daca dupa aceea zoom/pan ar fi perfect fluide. Il facem deci pe un
+        # thread de fundal si aratam un ecran de "Se incarca..." cat timp
+        # asteptam, ca utilizatorul sa stie ca aplicatia lucreaza, nu ca s-a
+        # blocat. Restul initializarii (in _finish_init) porneste abia dupa
+        # ce imaginea/rasterul e gata.
+        self.original_image = None
+        self._load_error = None
+
+        # Setat aici (nu in _finish_init) ca _on_close() sa functioneze corect
+        # chiar daca fereastra e inchisa CAT TIMP se mai incarca fisierul
+        # (inainte ca _finish_init sa apuce sa ruleze).
+        self._closing = threading.Event()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._show_loading_screen()
+
+        self._load_thread = threading.Thread(target=self._load_worker, daemon=True)
+        self._load_thread.start()
+        self.root.after(80, self._poll_load)
+
+    def _show_loading_screen(self):
+        self._loading_frame = tk.Frame(self.root, padx=60, pady=50)
+        self._loading_frame.pack(expand=True)
+        tk.Label(
+            self._loading_frame,
+            text="Se incarca planul, va rugam asteptati...",
+            font=("Arial", 12),
+        ).pack(pady=(0, 14))
+        self._loading_progress = ttk.Progressbar(
+            self._loading_frame, mode="indeterminate", length=280
+        )
+        self._loading_progress.pack()
+        self._loading_progress.start(12)
+
+    def _load_worker(self):
+        try:
+            self.original_image = load_image_from_path(self.image_path)
+        except Exception as e:
+            self._load_error = e
+
+    def _poll_load(self):
+        if self._load_thread.is_alive():
+            self.root.after(80, self._poll_load)
+            return
+
+        self._loading_progress.stop()
+        self._loading_frame.destroy()
+
+        if self._load_error is not None or self.original_image is None:
+            messagebox.showerror(
+                "Eroare la incarcarea fisierului",
+                str(self._load_error) if self._load_error is not None else "Fisier necunoscut.",
+                parent=self.root,
+            )
+            self.root.destroy()
+            return
+
+        self._finish_init()
+
+    def _finish_init(self):
         self.base_scale = self._compute_fit_scale(self.original_image.size)
         self.zoom_factor = 1.0
         self.scale = self.base_scale * self.zoom_factor
@@ -183,10 +274,8 @@ class ProblemAreaSelector:
         # Coada tine cel mult 1 element: la o cerere noua, golim orice cerere
         # veche neinceputa inca si punem doar cea mai recenta - nu are rost
         # sa randam o stare deja depasita.
-        # Semnalizeaza thread-ului de fundal ca fereastra se inchide, ca sa nu
-        # mai incerce sa predea un rezultat catre un root deja distrus.
-        self._closing = threading.Event()
-
+        # (self._closing e setat deja in __init__, inainte de incarcare - vezi
+        # acolo de ce.)
         self._render_queue = queue.Queue(maxsize=1)
         self._render_thread = threading.Thread(target=self._render_worker_loop, daemon=True)
         self._render_thread.start()
@@ -318,11 +407,12 @@ class ProblemAreaSelector:
         self.root.bind("<Control-minus>", lambda e: self.zoom(self.ZOOM_STEP_OUT))
         self.root.bind("<Control-0>", lambda e: self.reset_zoom())
 
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
     def _on_close(self):
         # opreste thread-ul de fundal INAINTE sa distrugem fereastra, ca sa
-        # nu mai incerce sa predea un rezultat catre un root deja disparut
+        # nu mai incerce sa predea un rezultat catre un root deja disparut.
+        # Legat deja de WM_DELETE_WINDOW in __init__, inainte de incarcare,
+        # ca sa functioneze si daca fereastra e inchisa in timpul ecranului
+        # de "Se incarca...".
         self._closing.set()
         self.root.destroy()
 
@@ -1091,13 +1181,10 @@ def main():
         return
 
     root = tk.Tk()
-    try:
-        app = ProblemAreaSelector(root, image_path)
-    except Exception as e:
-        root.withdraw()
-        messagebox.showerror("Eroare la incarcarea fisierului", str(e))
-        root.destroy()
-        return
+    # incarcarea fisierului e acum asincrona (vezi ProblemAreaSelector - arata
+    # singura un ecran de "Se incarca..." si isi gestioneaza propriile erori,
+    # inclusiv distrugerea ferestrei daca fisierul nu poate fi citit)
+    app = ProblemAreaSelector(root, image_path)
     root.mainloop()
 
 
