@@ -365,6 +365,11 @@ class ProblemAreaSelector:
         self.areas = []
         self._next_id = 1
 
+        # Cache pentru conturul desenului principal detectat automat (vezi
+        # _detect_drawing_bbox), folosit la exportul imaginii adnotate.
+        self._drawing_bbox_computed = False
+        self._cached_drawing_bbox = None
+
         # Stare pentru selectia curenta (drag)
         self.start_x = None
         self.start_y = None
@@ -1300,20 +1305,31 @@ class ProblemAreaSelector:
         messagebox.showinfo("Succes", f"Imaginea adnotata a fost salvata in:\n{path}")
 
     def _crop_to_areas(self, annotated):
-        """Decupeaza imaginea la conturul (bounding box) zonelor marcate, cu
-        o margine de context in jur - in loc sa pastram toata pagina bruta.
-        Multe PDF-uri au mult spatiu gol si alte elemente in afara desenului
-        propriu-zis (planul mare cu culori/hasuri), ceea ce facea legenda sa
+        """Decupeaza imaginea la conturul desenului principal (vezi
+        _detect_drawing_bbox) UNIT cu conturul zonelor marcate, plus o
+        margine de context - in loc sa pastram toata pagina bruta. Multe
+        PDF-uri au mult spatiu gol si alte elemente separate de desenul
+        propriu-zis (tabele, sageti, alte detalii), ceea ce facea legenda sa
         para "intr-un colt", minuscula si disproportionata fata de desen.
-        Decupand la desenul relevant, legenda ramane exact deasupra lui."""
+        Unim cu zonele marcate (nu doar desenul detectat) ca sa garantam ca
+        nicio problema marcata nu ramane in afara cadrului, chiar daca
+        detectia automata a desenului ar rata ceva."""
         xs0 = [a["original_coords"][0] for a in self.areas]
         ys0 = [a["original_coords"][1] for a in self.areas]
         xs1 = [a["original_coords"][2] for a in self.areas]
         ys1 = [a["original_coords"][3] for a in self.areas]
         x0, y0, x1, y1 = min(xs0), min(ys0), max(xs1), max(ys1)
 
-        pad_x = max(60, round((x1 - x0) * 0.08))
-        pad_y = max(60, round((y1 - y0) * 0.08))
+        drawing_bbox = self._detect_drawing_bbox()
+        if drawing_bbox is not None:
+            dx0, dy0, dx1, dy1 = drawing_bbox
+            x0 = min(x0, dx0)
+            y0 = min(y0, dy0)
+            x1 = max(x1, dx1)
+            y1 = max(y1, dy1)
+
+        pad_x = max(60, round((x1 - x0) * 0.04))
+        pad_y = max(60, round((y1 - y0) * 0.04))
 
         img_w, img_h = annotated.size
         crop_x0 = max(0, round(x0 - pad_x))
@@ -1322,6 +1338,131 @@ class ProblemAreaSelector:
         crop_y1 = min(img_h, round(y1 + pad_y))
 
         return annotated.crop((crop_x0, crop_y0, crop_x1, crop_y1))
+
+    def _detect_drawing_bbox(self):
+        """Detecteaza automat conturul (bounding box) desenului principal
+        din imagine - grupul cel mai mare de continut (linii, hasuri,
+        culori), distinct de elemente izolate mici de pe aceeasi pagina
+        (tabele, sageti, alte detalii separate spatial). Multe PDF-uri de
+        plan au o pagina mult mai mare decat desenul propriu-zis, cu alte
+        tabele/detalii imprastiate separat - fara aceasta detectie, imaginea
+        salvata ar include tot spatiul gol si elementele nelegate de desen.
+
+        Ruleaza pe o varianta MULT redusa a imaginii (nu pe rasterul
+        original, care poate avea sute de milioane de pixeli), ca sa ramana
+        rapid chiar fara numpy - foloseste doar PIL. Rezultatul (bounding
+        box) e scalat inapoi la rezolutia reala. Cacheaza rezultatul, ca
+        exporturi repetate in aceeasi sesiune sa nu repete detectia.
+        Returneaza None daca imaginea e complet alba (nimic de detectat)."""
+        if self._drawing_bbox_computed:
+            return self._cached_drawing_bbox
+
+        max_dim = 500
+        w, h = self.original_image.size
+        scale = min(1.0, max_dim / max(w, h))
+        small_w = max(1, round(w * scale))
+        small_h = max(1, round(h * scale))
+        small = self.original_image.resize((small_w, small_h), Image.BILINEAR)
+        px = small.load()
+
+        def is_background(r, g, b):
+            return r > 245 and g > 245 and b > 245
+
+        visited = bytearray(small_w * small_h)
+        components = []  # fiecare: [minx, miny, maxx, maxy, arie]
+
+        for sy in range(small_h):
+            row_base = sy * small_w
+            for sx in range(small_w):
+                idx0 = row_base + sx
+                if visited[idx0]:
+                    continue
+                visited[idx0] = 1
+                r, g, b = px[sx, sy]
+                if is_background(r, g, b):
+                    continue
+                # flood-fill (BFS/DFS cu stiva) pentru componenta curenta
+                stack = [(sx, sy)]
+                minx = maxx = sx
+                miny = maxy = sy
+                area = 0
+                while stack:
+                    x, y = stack.pop()
+                    area += 1
+                    if x < minx:
+                        minx = x
+                    elif x > maxx:
+                        maxx = x
+                    if y < miny:
+                        miny = y
+                    elif y > maxy:
+                        maxy = y
+                    for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                        if 0 <= nx < small_w and 0 <= ny < small_h:
+                            nidx = ny * small_w + nx
+                            if not visited[nidx]:
+                                visited[nidx] = 1
+                                nr, ng, nb = px[nx, ny]
+                                if not is_background(nr, ng, nb):
+                                    stack.append((nx, ny))
+                components.append([minx, miny, maxx, maxy, area])
+
+        if not components:
+            self._cached_drawing_bbox = None
+            self._drawing_bbox_computed = True
+            return None
+
+        # unim componentele apropiate spatial - un desen mare are adesea
+        # goluri interne (la intersectii, rotonde, capete de linii), care
+        # altfel l-ar rupe in "insule" separate - dar pastram elementele CU
+        # ADEVARAT departate (tabele, alte detalii) in grupuri separate
+        merge_margin = max(3, round(max(small_w, small_h) * 0.03))
+        n = len(components)
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+        for i in range(n):
+            ax0 = components[i][0] - merge_margin
+            ay0 = components[i][1] - merge_margin
+            ax1 = components[i][2] + merge_margin
+            ay1 = components[i][3] + merge_margin
+            for j in range(i + 1, n):
+                bx0, by0, bx1, by1 = components[j][:4]
+                if not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0):
+                    union(i, j)
+
+        groups = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(components[i])
+
+        best_bbox = None
+        best_area = 0
+        for members in groups.values():
+            total_area = sum(c[4] for c in members)
+            if total_area > best_area:
+                best_area = total_area
+                best_bbox = (
+                    min(c[0] for c in members),
+                    min(c[1] for c in members),
+                    max(c[2] for c in members),
+                    max(c[3] for c in members),
+                )
+
+        minx, miny, maxx, maxy = best_bbox
+        result = (minx / scale, miny / scale, (maxx + 1) / scale, (maxy + 1) / scale)
+        self._cached_drawing_bbox = result
+        self._drawing_bbox_computed = True
+        return result
 
     def _add_legend(self, annotated):
         """Adauga DEASUPRA imaginii adnotate o legenda cu descrierea fiecarei
