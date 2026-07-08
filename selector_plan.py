@@ -26,6 +26,7 @@ Zoom:
 """
 
 import json
+import math
 import os
 import queue
 import threading
@@ -129,7 +130,13 @@ def load_image_from_path(path):
 
 class ProblemAreaSelector:
 
-    MIN_ZOOM = 0.2
+    # NU permitem zoom sub 1.0 (planul deja incape complet in viewport la
+    # 1.0 - "fit to window"). Sub 1.0 nu mai ramane nimic util de aratat: cea
+    # mai mare parte a canvas-ului ar fi pur si simplu goala (nimic din plan
+    # acolo), ceea ce arata identic cu un bug de randare (zona gri care nu
+    # mai dispare niciodata) desi tehnic e "corect" - un plan mai mic decat
+    # fereastra e in continuare gol in jur.
+    MIN_ZOOM = 1.0
     # Marit mult (de la 20x): cum crop+resize costa la fel indiferent de
     # nivelul de zoom (bufferul randat are mereu marimea viewport-ului),
     # zoom-ul mare nu costa nimic in plus la viteza - doar la claritate
@@ -140,11 +147,19 @@ class ProblemAreaSelector:
     ZOOM_STEP_OUT = 0.8
 
     # Cat de mult mai mare randam bitmap-ul de fundal fata de viewport-ul
-    # vizibil (2.0 = 100% in plus pe fiecare dimensiune). Acest "buffer" in
-    # jurul zonei vizibile face ca o panoramare rapida sa nu iasa imediat
-    # in zona gri neandata - ai ceva "rezerva" de imagine deja randata
-    # pana vine urmatoarea randare de calitate.
-    OVERSCAN = 2.0
+    # vizibil (4.0 = 300% in plus pe fiecare dimensiune). Acest "buffer" in
+    # jurul zonei vizibile face ca o panoramare/zoom rapid sa nu iasa imediat
+    # in zona gri neandata - ai ceva "rezerva" de imagine deja randata pana
+    # vine urmatoarea randare de calitate.
+    #
+    # De ce atat de mare: la zoom-OUT, zona vizibila creste MULTIPLICATIV la
+    # fiecare pas (fiecare "notch" de scroll = ZOOM_STEP_OUT din zona
+    # anterioara) - la un burst rapid de cateva notch-uri la rand (normal la
+    # o rotita de mouse fizica), cresterea cumulata poate depasi usor un
+    # buffer mai mic inainte sa apuce sa vina o randare noua, lasand zona gri
+    # vizibila cateva sute de ms - la asta se referea senzatia de "chenare
+    # gri care apar des la schimbarea zoom-ului".
+    OVERSCAN = 4.0
 
     # La cel mult atatea secunde una de alta, lansam o randare noua chiar
     # daca interactiunea (drag/scroll/zoom) e inca in desfasurare - nu
@@ -152,7 +167,7 @@ class ProblemAreaSelector:
     # continuu si lung reseteaza mereu debounce-ul si bufferul OVERSCAN nu se
     # mai reimprospateaza deloc pana la eliberarea mouse-ului, ceea ce e
     # motivul principal pentru care apare zona gri la miscari mari.
-    RENDER_THROTTLE_INTERVAL = 0.15
+    RENDER_THROTTLE_INTERVAL = 0.05
 
     # La fel ca RENDER_THROTTLE_INTERVAL, dar pentru preview-ul instant de
     # zoom (_show_zoom_preview). Repictarea canvas-ului (incarcarea unui
@@ -178,6 +193,7 @@ class ProblemAreaSelector:
         # blocat. Restul initializarii (in _finish_init) porneste abia dupa
         # ce imaginea/rasterul e gata.
         self.original_image = None
+        self._pyramid = None
         self._load_error = None
 
         # Setat aici (nu in _finish_init) ca _on_close() sa functioneze corect
@@ -208,9 +224,50 @@ class ProblemAreaSelector:
 
     def _load_worker(self):
         try:
-            self.original_image = load_image_from_path(self.image_path)
+            image = load_image_from_path(self.image_path)
+            self._pyramid = self._build_pyramid(image)
+            # abia acum, dupa ce piramida e gata, publicam original_image -
+            # _poll_load se uita doar dupa acest atribut ca sa stie ca s-a
+            # terminat incarcarea (vezi mai jos)
+            self.original_image = image
         except Exception as e:
             self._load_error = e
+
+    @staticmethod
+    def _build_pyramid(image):
+        """Construieste un mic "pyramid" de variante ale imaginii, la
+        rezolutii progresiv injumatatite, pornind de la rasterul original
+        (nivelul 0 = original_image).
+
+        La zoom mic (aproape de "fit to window" - tot planul vizibil deodata),
+        zona vizibila acopera aproape TOT rasterul de baza, care poate avea
+        sute de milioane de pixeli. Fara piramida, fiecare randare la acel
+        nivel de zoom ar trebui sa citeasca/reduca rasterul INTREG - masurat
+        la 300-1000ms per randare pe un plan complex, ceea ce se simte exact
+        ca "zona gri care nu dispare" reclamata, pentru ca randarile nu mai
+        apucau sa tina pasul cu zoom-ul. Avand cateva variante mai mici deja
+        pregatite, alegem mereu (vezi _pick_pyramid_level) varianta cea mai
+        mica care tot ofera destula rezolutie pentru zoom-ul curent, deci
+        crop+resize ramane rapid (cateva ms) la orice nivel de zoom, nu doar
+        la zoom mare."""
+        levels = [image]
+        current = image
+        while max(current.size) > VIEWPORT_WIDTH * 3:
+            w, h = current.size
+            current = current.resize((max(1, w // 2), max(1, h // 2)), Image.BILINEAR)
+            levels.append(current)
+        return levels
+
+    def _pick_pyramid_level(self, scale):
+        """Alege indexul din self._pyramid a carui rezolutie e cea mai mica
+        posibila fara sa fie sub ce cere `scale` curent (ca sa nu introducem
+        blur suplimentar fata de ce s-ar vedea oricum din rasterul original
+        la acel nivel de zoom, dar sa evitam sa citim mai multi pixeli decat
+        avem nevoie)."""
+        if scale <= 0:
+            return len(self._pyramid) - 1
+        ideal_level = math.floor(math.log2(1.0 / scale)) if scale < 1 else 0
+        return max(0, min(int(ideal_level), len(self._pyramid) - 1))
 
     def _poll_load(self):
         if self._load_thread.is_alive():
@@ -534,15 +591,31 @@ class ProblemAreaSelector:
         randare finala cu interactive=False, care aduce claritatea maxima
         (LANCZOS). Se aplica identic pentru imagini si PDF-uri - PDF-ul e deja
         randat o singura data la incarcare (vezi load_image_from_path), deci
-        aici e mereu vorba de un simplu crop+resize pe un raster in memorie,
-        niciodata o re-randare din date vectoriale."""
+        aici e mereu vorba de un simplu crop+resize, niciodata o re-randare
+        din date vectoriale.
+
+        Crop-ul nu se face mereu din self.original_image (nivelul 0, plin) -
+        vezi _pick_pyramid_level: la zoom mic, unde zona vizibila acopera
+        aproape tot rasterul, cropul de pe nivelul 0 ar avea sute de milioane
+        de pixeli si resize-ul ar dura sute de ms la fiecare randare
+        (masurat: pana la ~1s pe un plan complex) - exact sursa "zonei gri
+        care nu dispare" la zoom mic/zoom-out rapid. Folosind un nivel deja
+        micsorat din piramida cand e suficient, crop+resize ramane rapid
+        (cateva ms) la ORICE nivel de zoom."""
         crop_x0, crop_y0, crop_x1, crop_y1 = crop_params["crop"]
         scale = crop_params["scale"]
         interactive = crop_params.get("interactive", False)
 
-        crop = self.original_image.crop(
-            (int(crop_x0), int(crop_y0), int(round(crop_x1)), int(round(crop_y1)))
-        )
+        level_idx = self._pick_pyramid_level(scale)
+        level_image = self._pyramid[level_idx]
+        level_factor = 2 ** level_idx
+
+        crop = level_image.crop((
+            int(crop_x0 / level_factor),
+            int(crop_y0 / level_factor),
+            int(round(crop_x1 / level_factor)),
+            int(round(crop_y1 / level_factor)),
+        ))
         target_w = max(1, round((crop_x1 - crop_x0) * scale))
         target_h = max(1, round((crop_y1 - crop_y0) * scale))
         resample = Image.BILINEAR if interactive else Image.LANCZOS
@@ -723,7 +796,7 @@ class ProblemAreaSelector:
             self._last_preview_paint_time = now
             self._show_zoom_preview()
 
-        self._request_bg_render(delay=100)
+        self._request_bg_render(delay=60)
 
     def _show_zoom_preview(self):
         """Cat timp asteptam randarea de calitate (thread de fundal), intindem/
