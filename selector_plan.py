@@ -147,19 +147,22 @@ class ProblemAreaSelector:
     ZOOM_STEP_OUT = 0.8
 
     # Cat de mult mai mare randam bitmap-ul de fundal fata de viewport-ul
-    # vizibil (4.0 = 300% in plus pe fiecare dimensiune). Acest "buffer" in
+    # vizibil (2.0 = 100% in plus pe fiecare dimensiune). Acest "buffer" in
     # jurul zonei vizibile face ca o panoramare/zoom rapid sa nu iasa imediat
     # in zona gri neandata - ai ceva "rezerva" de imagine deja randata pana
     # vine urmatoarea randare de calitate.
     #
-    # De ce atat de mare: la zoom-OUT, zona vizibila creste MULTIPLICATIV la
-    # fiecare pas (fiecare "notch" de scroll = ZOOM_STEP_OUT din zona
-    # anterioara) - la un burst rapid de cateva notch-uri la rand (normal la
-    # o rotita de mouse fizica), cresterea cumulata poate depasi usor un
-    # buffer mai mic inainte sa apuce sa vina o randare noua, lasand zona gri
-    # vizibila cateva sute de ms - la asta se referea senzatia de "chenare
-    # gri care apar des la schimbarea zoom-ului".
-    OVERSCAN = 4.0
+    # ATENTIE la marirea acestei valori: bitmap-ul PRODUS (nu doar cel citit
+    # ca sursa) are laturile de OVERSCAN * dimensiunea viewport-ului - la
+    # OVERSCAN=4.0 asta insemna un bitmap de iesire de 3800x2800 (10.6
+    # milioane de pixeli) la FIECARE randare, in loc de ~1900x1400 (2.7
+    # milioane) la 2.0 - de 4x mai multa munca de resize la fiecare pas de
+    # zoom, masurat la 100-450ms suplimentare per randare pe planul complex
+    # de test. Piramida de rezolutii (vezi _build_pyramid) rezolva deja
+    # problema sursei mari de citit la zoom mic, deci OVERSCAN nu mai are
+    # nevoie sa fie exagerat de mare doar pentru asta - 2.0 s-a dovedit
+    # suficient (testat: 0% zona gri chiar si la un burst rapid de zoom-out).
+    OVERSCAN = 2.0
 
     # La cel mult atatea secunde una de alta, lansam o randare noua chiar
     # daca interactiunea (drag/scroll/zoom) e inca in desfasurare - nu
