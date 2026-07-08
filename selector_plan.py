@@ -1299,9 +1299,12 @@ class ProblemAreaSelector:
         messagebox.showinfo("Succes", f"Imaginea adnotata a fost salvata in:\n{path}")
 
     def _add_legend(self, annotated):
-        """Adauga sub imaginea adnotata o legenda cu descrierea fiecarei
+        """Adauga DEASUPRA imaginii adnotate o legenda cu descrierea fiecarei
         probleme marcate (#id: descriere), ca informatia sa ramana vizibila
-        si in afara aplicatiei (nu doar in panoul lateral din interfata)."""
+        si in afara aplicatiei (nu doar in panoul lateral din interfata).
+        Deasupra (nu dedesubt) ca sa fie primul lucru vizibil la deschiderea
+        fisierului, fara sa fie nevoie sa derulezi pe langa un desen foarte
+        mare/inalt ca sa ajungi la ea."""
         img_w, img_h = annotated.size
 
         try:
@@ -1339,11 +1342,11 @@ class ProblemAreaSelector:
             legend_h += len(wrapped) * (line_h + line_spacing) + entry_spacing
         legend_h += margin
 
-        final_img = Image.new("RGB", (img_w, img_h + legend_h), "white")
-        final_img.paste(annotated, (0, 0))
+        final_img = Image.new("RGB", (img_w, legend_h + img_h), "white")
+        final_img.paste(annotated, (0, legend_h))
         draw = ImageDraw.Draw(final_img)
 
-        y = img_h + margin
+        y = margin
         draw.text((margin, y), header_text, fill="black", font=header_font)
         y += header_h + margin
 
