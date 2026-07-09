@@ -130,6 +130,26 @@ def load_image_from_path(path):
 
 class ProblemAreaSelector:
 
+    # Cele 6 culori disponibile pentru marcarea zonelor, fiecare cu o
+    # semnificatie aleasa de utilizator (vezi self.category_labels si
+    # butonul "Editeaza categorii"). Culorile insele sunt fixe (o paleta
+    # aleasa sa fie usor de deosebit una de alta si de restul planului -
+    # linii negre, hasuri cyan/magenta) - doar TEXTUL asociat fiecareia se
+    # poate schimba din interfata.
+    CATEGORY_COLORS = ["#e6194B", "#f58231", "#c9a600", "#3cb44b", "#4363d8", "#911eb4"]
+
+    # Etichetele implicite (generice) pentru cele 6 categorii - utilizatorul
+    # le poate redenumi oricand din butonul "Editeaza categorii", ca sa
+    # insemne orice are nevoie (tip de problema, severitate, etc.).
+    DEFAULT_CATEGORY_LABELS = [
+        "Categoria 1",
+        "Categoria 2",
+        "Categoria 3",
+        "Categoria 4",
+        "Categoria 5",
+        "Categoria 6",
+    ]
+
     # NU permitem zoom sub 1.0 (planul deja incape complet in viewport la
     # 1.0 - "fit to window"). Sub 1.0 nu mai ramane nimic util de aratat: cea
     # mai mare parte a canvas-ului ar fi pur si simplu goala (nimic din plan
@@ -361,9 +381,14 @@ class ProblemAreaSelector:
         self._last_preview_paint_time = None
 
         # Lista de zone. Fiecare element e un dict cu:
-        #   id, description, original_coords [x0,y0,x1,y1] in imaginea originala
+        #   id, description, category (index 0-5 in CATEGORY_COLORS),
+        #   original_coords [x0,y0,x1,y1] in imaginea originala
         self.areas = []
         self._next_id = 1
+
+        # Etichetele curente ale celor 6 categorii de culoare - editabile
+        # din interfata (vezi _edit_categories), independente per sesiune.
+        self.category_labels = list(self.DEFAULT_CATEGORY_LABELS)
 
         # Cache pentru conturul desenului principal detectat automat (vezi
         # _detect_drawing_bbox), folosit la exportul imaginii adnotate.
@@ -417,6 +442,9 @@ class ProblemAreaSelector:
         self.zoom_label = tk.Label(toolbar, text="Zoom: 100%")
         self.zoom_label.pack(side=tk.LEFT, padx=(0, 10))
 
+        tk.Button(toolbar, text="Editeaza categorii", command=self._edit_categories).pack(
+            side=tk.LEFT, padx=4, pady=4
+        )
         tk.Button(toolbar, text="Exporta zone (JSON)", command=self.export_json).pack(
             side=tk.LEFT, padx=4, pady=4
         )
@@ -993,6 +1021,124 @@ class ProblemAreaSelector:
         self.pan(direction, 0)
 
     # ------------------------------------------------------------------
+    # Categorii (culori) pentru zone
+
+    def _edit_categories(self):
+        """Deschide un dialog cu cate un camp de text pentru fiecare din
+        cele 6 culori disponibile, ca utilizatorul sa poata alege ce
+        inseamna fiecare (ex. tip de problema, nivel de severitate etc.)."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Editeaza categorii")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        tk.Label(
+            dialog,
+            text="Alege ce inseamna fiecare culoare:",
+            font=("Arial", 10, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8))
+
+        entries = []
+        for i, color in enumerate(self.CATEGORY_COLORS):
+            tk.Label(dialog, bg=color, width=4, height=1, relief="ridge").grid(
+                row=i + 1, column=0, padx=(12, 6), pady=4
+            )
+            entry = tk.Entry(dialog, width=32)
+            entry.insert(0, self.category_labels[i])
+            entry.grid(row=i + 1, column=1, padx=(0, 12), pady=4)
+            entries.append(entry)
+
+        def on_save():
+            for i, entry in enumerate(entries):
+                text = entry.get().strip()
+                if text:
+                    self.category_labels[i] = text
+            self._refresh_problem_list()
+            dialog.destroy()
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.grid(row=len(self.CATEGORY_COLORS) + 1, column=0, columnspan=2, pady=(4, 12))
+        tk.Button(btn_frame, text="Salveaza", command=on_save, width=12).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Anuleaza", command=dialog.destroy, width=12).pack(side=tk.LEFT, padx=6)
+
+        dialog.bind("<Return>", lambda e: on_save())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        entries[0].focus_set()
+
+    def _ask_area_details(self, initial_category=0, initial_description=""):
+        """Dialog modal pentru alegerea categoriei (culorii) si descrierea
+        unei zone - folosit atat la marcarea unei zone noi, cat si la
+        editarea uneia existente. Returneaza (categorie, descriere) sau
+        (None, None) daca utilizatorul renunta."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Detalii problema")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        result = {"category": None, "description": None}
+        selected = tk.IntVar(value=initial_category)
+
+        tk.Label(dialog, text="Categorie (culoare):", font=("Arial", 10, "bold")).pack(
+            anchor="w", padx=12, pady=(12, 4)
+        )
+
+        color_frame = tk.Frame(dialog)
+        color_frame.pack(padx=12, pady=(0, 4))
+
+        swatches = []
+
+        def update_highlight():
+            for i, sw in enumerate(swatches):
+                is_sel = selected.get() == i
+                sw.config(relief="sunken" if is_sel else "raised", borderwidth=4 if is_sel else 2)
+
+        def make_selector(i):
+            def _select():
+                selected.set(i)
+                update_highlight()
+                label_var.set(self.category_labels[i])
+            return _select
+
+        for i, color in enumerate(self.CATEGORY_COLORS):
+            sw = tk.Button(color_frame, bg=color, activebackground=color, width=4, height=2, command=make_selector(i))
+            sw.grid(row=0, column=i, padx=3)
+            swatches.append(sw)
+        update_highlight()
+
+        label_var = tk.StringVar(value=self.category_labels[initial_category])
+        tk.Label(dialog, textvariable=label_var, fg="gray30", font=("Arial", 9, "italic")).pack(
+            padx=12, pady=(0, 10)
+        )
+
+        tk.Label(dialog, text="Descriere:", font=("Arial", 10, "bold")).pack(anchor="w", padx=12)
+        desc_entry = tk.Entry(dialog, width=48)
+        desc_entry.insert(0, initial_description)
+        desc_entry.pack(padx=12, pady=(2, 12))
+        desc_entry.focus_set()
+        desc_entry.select_range(0, tk.END)
+
+        def on_ok():
+            result["category"] = selected.get()
+            result["description"] = desc_entry.get()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(pady=(0, 12))
+        tk.Button(btn_frame, text="OK", command=on_ok, width=12).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Anuleaza", command=on_cancel, width=12).pack(side=tk.LEFT, padx=6)
+
+        dialog.bind("<Return>", lambda e: on_ok())
+        dialog.bind("<Escape>", lambda e: on_cancel())
+
+        self.root.wait_window(dialog)
+        return result["category"], result["description"]
+
+    # ------------------------------------------------------------------
     # Evenimente mouse (selectie zona)
 
     def on_pan_start(self, event):
@@ -1062,11 +1208,7 @@ class ProblemAreaSelector:
             self.current_rect_id = None
             return
 
-        description = simpledialog.askstring(
-            "Descriere problema",
-            "Descrie problema din zona selectata:",
-            parent=self.root,
-        )
+        category, description = self._ask_area_details()
 
         self.canvas.delete(self.current_rect_id)
         self.current_rect_id = None
@@ -1082,6 +1224,7 @@ class ProblemAreaSelector:
         area = {
             "id": self._next_id,
             "description": description,
+            "category": category if category is not None else 0,
             "original_coords": orig_coords,
         }
         self._next_id += 1
@@ -1106,22 +1249,27 @@ class ProblemAreaSelector:
             ox0, oy0, ox1, oy1 = area["original_coords"]
             x0, y0 = self.original_to_widget(ox0, oy0)
             x1, y1 = self.original_to_widget(ox1, oy1)
+            color = self.CATEGORY_COLORS[area.get("category", 0)]
 
             existing = self._area_items.get(area["id"])
             if existing is not None:
-                # zona exista deja pe canvas: doar ii mutam coordonatele,
-                # fara sa stergem/recream elementele (mult mai rapid)
+                # zona exista deja pe canvas: doar ii mutam coordonatele
+                # (si repictam culoarea, daca s-a schimbat categoria la
+                # editare), fara sa stergem/recream elementele (mult mai
+                # rapid)
                 rect_id, text_id = existing
                 self.canvas.coords(rect_id, x0, y0, x1, y1)
                 self.canvas.coords(text_id, x0 + 4, y0 - 10)
+                self.canvas.itemconfig(rect_id, outline=color)
+                self.canvas.itemconfig(text_id, fill=color)
             else:
                 rect_id = self.canvas.create_rectangle(
-                    x0, y0, x1, y1, outline="red", width=2,
+                    x0, y0, x1, y1, outline=color, width=2,
                     tags=("area", f"area_{area['id']}")
                 )
                 text_id = self.canvas.create_text(
                     x0 + 4, y0 - 10, anchor=tk.W,
-                    text=f"#{area['id']}", fill="red",
+                    text=f"#{area['id']}", fill=color,
                     font=("Arial", 10, "bold"),
                     tags=("area", f"area_{area['id']}")
                 )
@@ -1137,11 +1285,15 @@ class ProblemAreaSelector:
 
     def _refresh_problem_list(self, select_id=None):
         self.problem_listbox.delete(0, tk.END)
-        for area in self.areas:
+        for idx, area in enumerate(self.areas):
             snippet = area["description"].splitlines()[0]
             if len(snippet) > 40:
                 snippet = snippet[:37] + "..."
             self.problem_listbox.insert(tk.END, f"#{area['id']}  {snippet}")
+            # coloram textul din lista cu culoarea categoriei zonei, ca sa
+            # se poata scana vizual rapid ce categorie are fiecare problema
+            color = self.CATEGORY_COLORS[area.get("category", 0)]
+            self.problem_listbox.itemconfig(idx, fg=color)
 
         if select_id is not None:
             for idx, area in enumerate(self.areas):
@@ -1164,9 +1316,12 @@ class ProblemAreaSelector:
         self.detail_text.config(state="normal")
         self.detail_text.delete("1.0", tk.END)
         if area is not None:
+            category_label = self.category_labels[area.get("category", 0)]
             self.detail_text.insert(
                 tk.END,
-                f"Problema #{area['id']}\n\n{area['description']}\n\n"
+                f"Problema #{area['id']}\n\n"
+                f"Categorie: {category_label}\n\n"
+                f"{area['description']}\n\n"
                 f"Coordonate (imagine originala): {area['original_coords']}"
             )
         self.detail_text.config(state="disabled")
@@ -1199,8 +1354,11 @@ class ProblemAreaSelector:
         if not rects:
             return
 
+        area = next((a for a in self.areas if a["id"] == area_id), None)
+        own_color = self.CATEGORY_COLORS[area.get("category", 0)] if area else "red"
+
         def toggle(count):
-            color = "yellow" if count % 2 == 0 else "red"
+            color = "yellow" if count % 2 == 0 else own_color
             for r in rects:
                 self.canvas.itemconfig(r, outline=color, width=3 if color == "yellow" else 2)
             if count < times:
@@ -1214,14 +1372,14 @@ class ProblemAreaSelector:
             messagebox.showinfo("Info", "Selecteaza mai intai o problema din lista.")
             return
 
-        new_description = simpledialog.askstring(
-            "Editeaza descriere",
-            "Descrierea problemei:",
-            initialvalue=area["description"],
-            parent=self.root,
+        category, description = self._ask_area_details(
+            initial_category=area.get("category", 0),
+            initial_description=area["description"],
         )
-        if new_description:
-            area["description"] = new_description
+        if description:
+            area["description"] = description
+            area["category"] = category if category is not None else area.get("category", 0)
+            self._redraw_areas()
             self._refresh_problem_list(select_id=area["id"])
 
     def delete_selected(self):
@@ -1263,6 +1421,8 @@ class ProblemAreaSelector:
             {
                 "id": a["id"],
                 "descriere": a["description"],
+                "categorie": self.category_labels[a.get("category", 0)],
+                "culoare": self.CATEGORY_COLORS[a.get("category", 0)],
                 "coordonate_imagine_originala": a["original_coords"],
             }
             for a in self.areas
@@ -1296,8 +1456,9 @@ class ProblemAreaSelector:
 
         for area in self.areas:
             x0, y0, x1, y1 = area["original_coords"]
-            draw.rectangle([x0, y0, x1, y1], outline="red", width=3)
-            draw.text((x0 + 4, max(0, y0 - 22)), f"#{area['id']}", fill="red", font=font)
+            color = self.CATEGORY_COLORS[area.get("category", 0)]
+            draw.rectangle([x0, y0, x1, y1], outline=color, width=3)
+            draw.text((x0 + 4, max(0, y0 - 22)), f"#{area['id']}", fill=color, font=font)
 
         cropped = self._crop_to_areas(annotated)
         final_image = self._add_legend(cropped)
@@ -1465,20 +1626,24 @@ class ProblemAreaSelector:
         return result
 
     def _add_legend(self, annotated):
-        """Adauga DEASUPRA imaginii adnotate o legenda cu descrierea fiecarei
-        probleme marcate (#id: descriere), ca informatia sa ramana vizibila
-        si in afara aplicatiei (nu doar in panoul lateral din interfata).
-        Deasupra (nu dedesubt) ca sa fie primul lucru vizibil la deschiderea
-        fisierului, fara sa fie nevoie sa derulezi pe langa un desen foarte
-        mare/inalt ca sa ajungi la ea."""
+        """Adauga DEASUPRA imaginii adnotate DOUA legende separate:
+        1. "Legenda categorii (culori)" - ce inseamna fiecare din cele 6
+           culori disponibile (vezi self.category_labels).
+        2. "Legenda probleme identificate" - #id: descriere pentru fiecare
+           zona marcata, cu id-ul colorat in culoarea categoriei sale.
+        Separate printr-o linie, ca semnificatia culorilor sa fie clara
+        independent de lista de probleme. Deasupra (nu dedesubt) ca sa fie
+        primul lucru vizibil la deschiderea fisierului, fara sa fie nevoie
+        sa derulezi pe langa un desen foarte mare/inalt ca sa ajungi la ea."""
         img_w, img_h = annotated.size
 
         try:
             header_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 26)
+            subheader_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 20)
             id_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
             text_font = ImageFont.truetype("DejaVuSans.ttf", 18)
         except Exception:
-            header_font = id_font = text_font = ImageFont.load_default()
+            header_font = subheader_font = id_font = text_font = ImageFont.load_default()
 
         margin = 24
         line_spacing = 6
@@ -1487,12 +1652,33 @@ class ProblemAreaSelector:
 
         measurer = ImageDraw.Draw(annotated)
 
+        # --- date pentru legenda de culori ---
+        color_header_text = "Legenda categorii (culori)"
+        color_header_bbox = measurer.textbbox((0, 0), color_header_text, font=subheader_font)
+        color_header_h = color_header_bbox[3] - color_header_bbox[1]
+
+        swatch_size = 22
+        text_line_bbox = measurer.textbbox((0, 0), "Ag", font=text_font)
+        text_line_h = text_line_bbox[3] - text_line_bbox[1]
+        color_row_h = max(swatch_size, text_line_h)
+
+        n_colors = len(self.CATEGORY_COLORS)
+        # latimea coloanei se calculeaza din textul EFECTIV al etichetelor
+        # (nu se imparte pur si simplu latimea imaginii la numarul de
+        # coloane) - altfel, pe un desen foarte lat, a doua coloana ar
+        # ajunge mult prea departe de prima, cu spatiu gol inutil intre ele
+        max_label_w = 0
+        for label in self.category_labels:
+            label_bbox = measurer.textbbox((0, 0), label, font=text_font)
+            max_label_w = max(max_label_w, label_bbox[2] - label_bbox[0])
+        col_width = swatch_size + 10 + max_label_w + 40
+        n_cols = max(1, min(3, max_text_width // col_width))
+        n_rows = math.ceil(n_colors / n_cols)
+
+        # --- date pentru legenda de probleme ---
         header_text = "Legenda probleme identificate"
         header_bbox = measurer.textbbox((0, 0), header_text, font=header_font)
         header_h = header_bbox[3] - header_bbox[1]
-
-        line_bbox = measurer.textbbox((0, 0), "Ag", font=text_font)
-        line_h = line_bbox[3] - line_bbox[1]
 
         entries = []
         for area in sorted(self.areas, key=lambda a: a["id"]):
@@ -1501,11 +1687,22 @@ class ProblemAreaSelector:
             id_w = id_bbox[2] - id_bbox[0]
             wrap_width = max(60, max_text_width - id_w - 10)
             wrapped = self._wrap_text_lines(measurer, area["description"], text_font, wrap_width)
-            entries.append((id_text, id_w, wrapped or [""]))
+            color = self.CATEGORY_COLORS[area.get("category", 0)]
+            entries.append((id_text, id_w, wrapped or [""], color))
 
-        legend_h = margin + header_h + margin
-        for _, _, wrapped in entries:
-            legend_h += len(wrapped) * (line_h + line_spacing) + entry_spacing
+        # inaltimea totala a blocului de legenda - calculata o singura data,
+        # apoi refolosita identic si la desenarea efectiva mai jos, ca sa nu
+        # poata aparea vreo nepotrivire intre spatiul rezervat si ce se
+        # deseneaza cu adevarat
+        legend_h = margin
+        legend_h += color_header_h + 12
+        legend_h += n_rows * (color_row_h + 10)
+        legend_h += margin  # spatiu inainte de linia despartitoare
+        legend_h += 2  # linia despartitoare in sine
+        legend_h += margin  # spatiu dupa linia despartitoare
+        legend_h += header_h + margin
+        for _, _, wrapped, _ in entries:
+            legend_h += len(wrapped) * (text_line_h + line_spacing) + entry_spacing
         legend_h += margin
 
         final_img = Image.new("RGB", (img_w, legend_h + img_h), "white")
@@ -1513,15 +1710,33 @@ class ProblemAreaSelector:
         draw = ImageDraw.Draw(final_img)
 
         y = margin
+        draw.text((margin, y), color_header_text, fill="black", font=subheader_font)
+        y += color_header_h + 12
+
+        for i, color in enumerate(self.CATEGORY_COLORS):
+            row, col = divmod(i, n_cols)
+            cx = margin + col * col_width
+            cy = y + row * (color_row_h + 10)
+            draw.rectangle(
+                [cx, cy, cx + swatch_size, cy + swatch_size], fill=color, outline="black"
+            )
+            draw.text(
+                (cx + swatch_size + 10, cy), self.category_labels[i], fill="black", font=text_font
+            )
+        y += n_rows * (color_row_h + 10) + margin
+
+        draw.line([(margin, y), (img_w - margin, y)], fill=(190, 190, 190), width=2)
+        y += 2 + margin
+
         draw.text((margin, y), header_text, fill="black", font=header_font)
         y += header_h + margin
 
-        for id_text, id_w, wrapped in entries:
-            draw.text((margin, y), id_text, fill="red", font=id_font)
+        for id_text, id_w, wrapped, color in entries:
+            draw.text((margin, y), id_text, fill=color, font=id_font)
             text_x = margin + id_w + 10
             for line in wrapped:
                 draw.text((text_x, y), line, fill="black", font=text_font)
-                y += line_h + line_spacing
+                y += text_line_h + line_spacing
             y += entry_spacing
 
         return final_img
